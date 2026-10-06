@@ -11,11 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Hierarchical Recursive Doubling Reduce-Scatter Implementation."""
+"""Hierarchical Recursive Doubling & All-to-All Reduce-Scatter Implementation."""
 
+import functools
 import math
+from typing import Callable
 
 import jax
+import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental import shard_map
 from jax.experimental.pallas import tpu as pltpu
@@ -23,6 +26,145 @@ from jax.experimental.pallas import tpu as pltpu
 
 def _next_multiple_of(val, multiple):
     return ((val + multiple - 1) // multiple) * multiple
+
+
+def _reduce_epilogue_kernel(
+    x_ref,
+    o_ref,
+    *,
+    num_devices: int = 8,
+    activation: Callable[[jax.Array], jax.Array] | None = None,
+):
+    """Pairwise tree reduction in float32 inside VMEM with optional activation epilogue."""
+    x = x_ref[...]
+    if num_devices == 8:
+        s01 = x[0].astype(jnp.float32) + x[1].astype(jnp.float32)
+        s23 = x[2].astype(jnp.float32) + x[3].astype(jnp.float32)
+        s0123 = s01 + s23
+
+        s45 = x[4].astype(jnp.float32) + x[5].astype(jnp.float32)
+        s67 = x[6].astype(jnp.float32) + x[7].astype(jnp.float32)
+        s4567 = s45 + s67
+
+        acc = s0123 + s4567
+    else:
+        acc = x[0].astype(jnp.float32)
+        for i in range(1, num_devices):
+            acc = acc + x[i].astype(jnp.float32)
+
+    if activation is not None:
+        acc = activation(acc)
+    o_ref[...] = acc.astype(o_ref.dtype)
+
+
+def _reduce_residual_epilogue_kernel(
+    x_ref,
+    res_ref,
+    o_ref,
+    *,
+    num_devices: int = 8,
+    activation: Callable[[jax.Array], jax.Array] | None = None,
+):
+    """Pairwise tree reduction in float32 fused with residual addition and activation in VMEM."""
+    x = x_ref[...]
+    if num_devices == 8:
+        s01 = x[0].astype(jnp.float32) + x[1].astype(jnp.float32)
+        s23 = x[2].astype(jnp.float32) + x[3].astype(jnp.float32)
+        s0123 = s01 + s23
+
+        s45 = x[4].astype(jnp.float32) + x[5].astype(jnp.float32)
+        s67 = x[6].astype(jnp.float32) + x[7].astype(jnp.float32)
+        s4567 = s45 + s67
+
+        acc = s0123 + s4567
+    else:
+        acc = x[0].astype(jnp.float32)
+        for i in range(1, num_devices):
+            acc = acc + x[i].astype(jnp.float32)
+
+    acc = acc + res_ref[...].astype(jnp.float32)
+    if activation is not None:
+        acc = activation(acc)
+    o_ref[...] = acc.astype(o_ref.dtype)
+
+
+def all_to_all_reduce_scatter_local(
+    local_x: jax.Array,
+    num_devices: int,
+    *,
+    axis_name: str | tuple[str, ...] = 'x',
+    bm: int = 256,
+    bd: int = 2048,
+    residual: jax.Array | None = None,
+    activation: Callable[[jax.Array], jax.Array] | None = None,
+) -> jax.Array:
+    """Bandwidth-optimal reduce-scatter via native-dtype all_to_all + VMEM fp32 tree reduction.
+
+    Exchanges shards in local_x.dtype (e.g. bfloat16, halving ICI wire traffic
+    relative to float32 pre-cast) and accumulates in float32 in VMEM with optional
+    fused residual addition and activation epilogue.
+    """
+    seq_len_dim, hidden_size_dim = local_x.shape
+    final_chunk_size = seq_len_dim // num_devices
+
+    x_chunks = local_x.reshape((num_devices, final_chunk_size, hidden_size_dim))
+    received = jax.lax.all_to_all(
+        x_chunks, axis_name, split_axis=0, concat_axis=0
+    )
+
+    bm_eff = min(bm, final_chunk_size)
+    while final_chunk_size % bm_eff != 0 and bm_eff > 16:
+        bm_eff //= 2
+    bd_eff = min(bd, hidden_size_dim)
+    while hidden_size_dim % bd_eff != 0 and bd_eff > 128:
+        bd_eff //= 2
+
+    grid = (final_chunk_size // bm_eff, hidden_size_dim // bd_eff)
+    out_shape = jax.ShapeDtypeStruct(
+        (final_chunk_size, hidden_size_dim), local_x.dtype
+    )
+
+    if residual is not None:
+        in_specs = [
+            pl.BlockSpec(
+                (num_devices, bm_eff, bd_eff), lambda i, j: (0, i, j)
+            ),
+            pl.BlockSpec((bm_eff, bd_eff), lambda i, j: (i, j)),
+        ]
+        return pl.pallas_call(
+            functools.partial(
+                _reduce_residual_epilogue_kernel,
+                num_devices=num_devices,
+                activation=activation,
+            ),
+            out_shape=out_shape,
+            grid=grid,
+            in_specs=in_specs,
+            out_specs=pl.BlockSpec((bm_eff, bd_eff), lambda i, j: (i, j)),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=('parallel', 'parallel'),
+                vmem_limit_bytes=64 * 1024 * 1024,
+            ),
+        )(received, residual)
+
+    in_specs = [
+        pl.BlockSpec((num_devices, bm_eff, bd_eff), lambda i, j: (0, i, j))
+    ]
+    return pl.pallas_call(
+        functools.partial(
+            _reduce_epilogue_kernel,
+            num_devices=num_devices,
+            activation=activation,
+        ),
+        out_shape=out_shape,
+        grid=grid,
+        in_specs=in_specs,
+        out_specs=pl.BlockSpec((bm_eff, bd_eff), lambda i, j: (i, j)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=('parallel', 'parallel'),
+            vmem_limit_bytes=64 * 1024 * 1024,
+        ),
+    )(received)
 
 
 # Asynchronously accumulates received data into a running sum using VMEM buffers.
@@ -34,6 +176,7 @@ def _accumulate(
     vmem_run,
     sync_sems,
     vmem_idx=0,
+    activation: Callable[[jax.Array], jax.Array] | None = None,
 ):
     load_recv_sem, load_run_sem, store_run_sem = sync_sems
 
@@ -46,8 +189,13 @@ def _accumulate(
     load_recv_op.wait()
     load_run_op.wait()
 
-    vmem_run[vmem_idx,
-             ...] = vmem_run[vmem_idx, ...] + vmem_recv[vmem_idx, ...]
+    acc = (
+        vmem_run[vmem_idx, ...].astype(jnp.float32)
+        + vmem_recv[vmem_idx, ...].astype(jnp.float32)
+    )
+    if activation is not None:
+        acc = activation(acc)
+    vmem_run[vmem_idx, ...] = acc.astype(vmem_run.dtype)
 
     if out_hbm is not None:
         store_run_op = pltpu.make_async_copy(vmem_run.at[vmem_idx], out_hbm,
@@ -60,14 +208,6 @@ def _accumulate(
     return store_run_op
 
 
-# Calculates the specific chunk index representing a hypercube node's data.
-#
-#   This function determines which chunk of the global tensor this device should
-#   operate on during a specific step of the hypercube algorithm. It constructs
-#   the chunk index by combining bits from:
-#   1. The device's own ID for dimensions already processed (prev_dims).
-#   2. The loop index for dimensions yet to be processed (future_dims).
-#   3. The target dimension's value (dim_val).
 def _get_hypercube_chunk_idx(loop_idx, future_dims, prev_dims, my_chip_id,
                              target_dim, dim_val):
     base = 0
@@ -81,7 +221,6 @@ def _get_hypercube_chunk_idx(loop_idx, future_dims, prev_dims, my_chip_id,
     return base
 
 
-# TODO(dawnhan): Put inter/intra operations into private helper functions.
 def hier_rs_kernel(
     input_ref,
     output_ref,
@@ -102,7 +241,9 @@ def hier_rs_kernel(
     final_chunk_size: int,
     full_chunk_size: int,
     mb_size: int,
+    vmem_pipeline_depth: int = 4,
     axis_name: str = 'x',
+    activation: Callable[[jax.Array], jax.Array] | None = None,
 ):
     sync_sems = (load_recv_sem, load_run_sem, store_run_sem)
 
@@ -116,8 +257,6 @@ def hier_rs_kernel(
     cur_chiplet_bit = cur_id % 2
     is_even = cur_chiplet_bit == 0
     twin_id = jax.lax.select(is_even, cur_id + 1, cur_id - 1)
-
-    vmem_pipeline_depth = 4  # Outstanding VMEM accumulation stages
 
     # Phase 1: Intra-chip Reduce-Scatter (Fast Link)
     with jax.named_scope('phase1_intra_chip'):
@@ -194,18 +333,8 @@ def hier_rs_kernel(
                 s_op.wait()
 
     # Phase 2: Inter-chip Reduce-Scatter (3D Concurrent with Micro-batching)
-    # Perform reduce-scatter across chips using a hypercube algorithm.
-    # In each step, chips exchange data along one dimension of the hypercube.
-    # By the end of all steps, each chip holds a fully reduced chunk of the data.
-    # Example for a 4-chip setup (2 hypercube dimensions):
-    # Chip IDs in binary: 00, 01, 10, 11
-    # Step 0 (dim=0):
-    #   - Chip 00 exchanges with 01 (differs in bit 0)
-    #   - Chip 10 exchanges with 11
-    # Step 1 (dim=1):
-    #   - Chip 00 exchanges with 10 (differs in bit 1)
-    #   - Chip 01 exchanges with 11
     for phase_step in range(num_hypercube_dims):
+        is_last_step = phase_step == num_hypercube_dims - 1
         with jax.named_scope(f'phase2_step_{phase_step}'):
             all_mb_ops = []
             for micro_batch_idx in range(num_micro_batches):
@@ -215,17 +344,12 @@ def hier_rs_kernel(
                 for op_idx in range(num_ops_in_step):
 
                     for hypercube_dim_idx in range(num_hypercube_dims):
-                        # Rotate the dimension we operate on based on the phase step.
-                        # This helps in structuring the recursive doubling.
                         dim = (hypercube_dim_idx +
                                phase_step) % num_hypercube_dims
-                        # Find the neighbor chip that differs only in the 'dim' bit.
                         neighbor_chip_id = cur_chip_id ^ (1 << dim)
                         my_dim_bit = (cur_chip_id >> dim) & 1
                         neigh_dim_bit = 1 - my_dim_bit
 
-                        # Keep track of resolved (prev) and unresolved (future) dimensions
-                        # to calculate which chunk of data to operate on.
                         prev_dims = [
                             (hypercube_dim_idx + j) % num_hypercube_dims
                             for j in range(phase_step)
@@ -302,6 +426,14 @@ def hier_rs_kernel(
                 for op_id, (op, my_chunk_idx, c_start,
                             k_sz) in enumerate(all_mb_ops[micro_batch_idx]):
                     op.wait()
+                    # On the final hypercube step, write directly to output_ref
+                    # and apply optional activation epilogue in VMEM, avoiding
+                    # the extra HBM-to-HBM final_copy_op round-trip.
+                    out_target = (
+                        output_ref.at[pl.ds(0, final_chunk_size), pl.ds(c_start, k_sz)]
+                        if is_last_step
+                        else None
+                    )
                     s_op = _accumulate(
                         recv_hbm=recv_buf_ref.at[
                             pl.ds(my_chunk_idx *
@@ -313,7 +445,7 @@ def hier_rs_kernel(
                                   final_chunk_size, final_chunk_size),
                             pl.ds(c_start, k_sz),
                         ],
-                        out_hbm=None,
+                        out_hbm=out_target,
                         vmem_recv=vmem_recv_ref.at[:,
                                                    pl.ds(0, final_chunk_size),
                                                    pl.ds(0, k_sz)],
@@ -322,23 +454,21 @@ def hier_rs_kernel(
                                                  pl.ds(0, k_sz)],
                         sync_sems=sync_sems,
                         vmem_idx=op_id % vmem_pipeline_depth,
+                        activation=activation if is_last_step else None,
                     )
                     store_ops.append(s_op)
                 for s_op in store_ops:
                     s_op.wait()
 
-    # TODO(dawnhan): Update the algorithm to avoid the final copy.
-    # Scatter Phase: Each device copies its designated shard of the fully
-    # reduced data from the running sum to the final output buffer, determined
-    # by its unique logical ID.
-    final_copy_op = pltpu.make_async_copy(
-        src_ref=running_sum_ref.at[
-            pl.ds(cur_id * final_chunk_size, final_chunk_size), :],
-        dst_ref=output_ref,
-        sem=final_copy_sem,
-    )
-    final_copy_op.start()
-    final_copy_op.wait()
+    if num_hypercube_dims == 0:
+        final_copy_op = pltpu.make_async_copy(
+            src_ref=running_sum_ref.at[
+                pl.ds(cur_id * final_chunk_size, final_chunk_size), :],
+            dst_ref=output_ref,
+            sem=final_copy_sem,
+        )
+        final_copy_op.start()
+        final_copy_op.wait()
 
 
 def hierarchical_reduce_scatter_local(
@@ -346,19 +476,68 @@ def hierarchical_reduce_scatter_local(
     num_devices: int,
     num_micro_batches: int = 2,
     axis_name: str | tuple[str, ...] = 'x',
+    *,
+    max_vmem_scratch_bytes: int = 32 * 1024 * 1024,
+    use_all_to_all: bool = False,
+    residual: jax.Array | None = None,
+    activation: Callable[[jax.Array], jax.Array] | None = None,
 ) -> jax.Array:
+    if use_all_to_all or residual is not None:
+        return all_to_all_reduce_scatter_local(
+            local_x,
+            num_devices=num_devices,
+            axis_name=axis_name,
+            residual=residual,
+            activation=activation,
+        )
+
     num_chips = num_devices // 2
     num_hypercube_dims = int(math.log2(num_chips)) if num_chips > 0 else 0
 
     seq_len_dim = local_x.shape[0]
     hidden_size_dim = local_x.shape[1]
+    final_chunk_size = seq_len_dim // num_devices
+
+    # Auto-scale num_micro_batches (and vmem_pipeline_depth if needed) so the
+    # two VMEM scratch buffers (2 * depth * final_chunk_size * max_vmem_mb_size)
+    # never exceed VMEM capacity on large shapes (e.g. Hard: m=32768, d=4096).
+    dtype_bytes = jax.dtypes.canonicalize_dtype(local_x.dtype).itemsize
+    vmem_pipeline_depth = 4
+    max_mbs = max(1, hidden_size_dim // 128)
+    while num_micro_batches < max_mbs:
+        cand_vmem_mb_size = _next_multiple_of(
+            hidden_size_dim // num_micro_batches, 128
+        )
+        total_vmem_bytes = (
+            2
+            * vmem_pipeline_depth
+            * final_chunk_size
+            * cand_vmem_mb_size
+            * dtype_bytes
+        )
+        if total_vmem_bytes <= max_vmem_scratch_bytes:
+            break
+        num_micro_batches *= 2
+
+    max_vmem_mb_size = _next_multiple_of(
+        hidden_size_dim // num_micro_batches, 128
+    )
+    while (
+        vmem_pipeline_depth > 1
+        and 2
+        * vmem_pipeline_depth
+        * final_chunk_size
+        * max_vmem_mb_size
+        * dtype_bytes
+        > max_vmem_scratch_bytes
+    ):
+        vmem_pipeline_depth //= 2
 
     chunk_size_raw = (hidden_size_dim // num_hypercube_dims
                       if num_hypercube_dims > 0 else hidden_size_dim)
     full_chunk_size = _next_multiple_of(chunk_size_raw, 128)
-    mb_size_raw = full_chunk_size // num_micro_batches
+    mb_size_raw = max(1, full_chunk_size // num_micro_batches)
     mb_size = _next_multiple_of(mb_size_raw, 128)
-    final_chunk_size = seq_len_dim // num_devices
 
     out_shape = jax.ShapeDtypeStruct((final_chunk_size, hidden_size_dim),
                                      local_x.dtype)
@@ -367,14 +546,15 @@ def hierarchical_reduce_scatter_local(
     recv_buf_shape = jax.ShapeDtypeStruct((seq_len_dim, hidden_size_dim),
                                           local_x.dtype)
 
-    # Size VMEM buffers to hold only one micro-batch at a time to avoid OOM,
-    # aligned to 128 bytes for efficient TPU DMA transfers.
-    max_vmem_mb_size = _next_multiple_of(hidden_size_dim // num_micro_batches,
-                                         128)
-
     scratch_shapes = [
-        pltpu.VMEM((4, final_chunk_size, max_vmem_mb_size), local_x.dtype),
-        pltpu.VMEM((4, final_chunk_size, max_vmem_mb_size), local_x.dtype),
+        pltpu.VMEM(
+            (vmem_pipeline_depth, final_chunk_size, max_vmem_mb_size),
+            local_x.dtype,
+        ),
+        pltpu.VMEM(
+            (vmem_pipeline_depth, final_chunk_size, max_vmem_mb_size),
+            local_x.dtype,
+        ),
         pltpu.SemaphoreType.DMA,
         pltpu.SemaphoreType.DMA((num_chips, num_micro_batches)),
         pltpu.SemaphoreType.DMA,
@@ -412,13 +592,18 @@ def hierarchical_reduce_scatter_local(
         final_chunk_size=final_chunk_size,
         full_chunk_size=full_chunk_size,
         mb_size=mb_size,
+        vmem_pipeline_depth=vmem_pipeline_depth,
         axis_name=axis_name,
+        activation=activation,
     )
 
     hier_rs = pl.pallas_call(
         kernel_fn,
         out_shape=(out_shape, running_sum_shape, recv_buf_shape),
         grid_spec=grid_spec,
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=96 * 1024 * 1024,
+        ),
     )
 
     final_out, _, _ = hier_rs(local_x)
@@ -432,12 +617,21 @@ def hierarchical_reduce_scatter(
     in_specs: jax.sharding.PartitionSpec = jax.sharding.PartitionSpec(
         'x', None),
     num_micro_batches: int = 2,
+    use_all_to_all: bool = False,
+    residual: jax.Array | None = None,
+    activation: Callable[[jax.Array], jax.Array] | None = None,
 ) -> jax.Array:
     num_devices = mesh.devices.size
 
     def inner(local_x):
-        return hierarchical_reduce_scatter_local(local_x, num_devices,
-                                                 num_micro_batches)
+        return hierarchical_reduce_scatter_local(
+            local_x,
+            num_devices,
+            num_micro_batches,
+            use_all_to_all=use_all_to_all,
+            residual=residual,
+            activation=activation,
+        )
 
     return shard_map.shard_map(
         inner,
